@@ -1,7 +1,7 @@
 #include <reduce/block_reduce.hpp>
 
 template <const int STRIDE=32>
-__device__ __forceinline__ double warp_reduce(double v) {
+static __device__ __forceinline__ double warp_reduce(double v) {
 #pragma unroll
   for(int stride = STRIDE >> 1; stride > 0; stride >>= 1) {
     v += __shfl_xor_sync(0xffffffff, v, stride);
