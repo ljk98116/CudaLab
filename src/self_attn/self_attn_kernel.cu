@@ -16,133 +16,90 @@ static __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
-static __device__ float block_reduce_max_Y(float v, int N, float *gBlkData) {
-  if(N <= BLOCK_SIZE) {
-    __shared__ float sData[WARP_NUM];
-    int tidY = threadIdx.x;
-    int warp_id = tidY / WARP_SIZE;
-    int lane_id = tidY % WARP_SIZE;
-    v = warp_reduce_max(v);
-    if(lane_id == 0) {
-        sData[warp_id] = v;
-    }
-    __syncthreads();
-    v = lane_id < WARP_NUM ? sData[lane_id] : FLT_MIN;
-    if(warp_id == 0) {
-      v = warp_reduce_max(v);
-    }
-    if(tidY == 0) {
-      sData[tidY] = v;
-    }
-    __syncthreads();
-    return sData[0];
-  }
-  int tidY = threadIdx.x;
-  int offX = threadIdx.y + blockDim.y * blockIdx.y;
-  
-  const int warp_num = (N + WARP_SIZE - 1) / WARP_SIZE;
-  const int off = offX * warp_num;
-
-  int warp_id = tidY / WARP_SIZE;
-  int lane_id = tidY % WARP_SIZE;
-
-  v = warp_reduce_max(v);
-  // 全局store
-  if(lane_id == 0) {
-    gBlkData[off + warp_id] = v;
-  }
-  // 全局Load
-  // 不同warp的lane_id=0都是v
-  for(int stride = warp_num >> 1; stride > 0; stride >>= 1) {
-    gBlkData[off + warp_id] = fmaxf(gBlkData[off + warp_id], gBlkData[off + warp_id + stride]);
-  }
-  return gBlkData[off];    
-}
-
-static __device__ float block_reduce_sum_Y(float v, float maxVal, int N, float *gBlkData) {
-  v = exp(v - maxVal);
-  if(N <= BLOCK_SIZE) {
-    __shared__ float sData[WARP_NUM];
-    int tidY = threadIdx.x;
-    int warp_id = tidY / WARP_SIZE;
-    int lane_id = tidY % WARP_SIZE;
-    v = warp_reduce_sum(v);
-    if(lane_id == 0) {
-      sData[warp_id] = v;
-    }
-    __syncthreads();
-    v = lane_id < WARP_NUM ? sData[lane_id] : 0.0f;
-    if(warp_id == 0) {
-      v = warp_reduce_sum(v);
-    }
-    if(tidY == 0) {
-      sData[tidY] = v;
-    }
-    __syncthreads();
-    return sData[0];
-  }
-  int tidY = threadIdx.x;
-  int offX = threadIdx.y + blockDim.y * blockIdx.y;
-  
-  const int warp_sum = (N + WARP_SIZE - 1) / WARP_SIZE;
-  const int off = offX * warp_sum;
-
-  int warp_id = tidY / WARP_SIZE;
-  int lane_id = tidY % WARP_SIZE;
-
-  v = warp_reduce_sum(v);
-  // 全局store
-  if(lane_id == 0) {
-    gBlkData[off + warp_id] = v;
-  }
-  // 全局Load
-  // 不同warp的lane_id=0都是v
-  for(int stride = warp_sum >> 1; stride > 0; stride >>= 1) {
-    gBlkData[off + warp_id] += gBlkData[off + warp_id + stride];
-  }
-  return gBlkData[off];    
-}
-
 // softmax以行为单位, 对[M,N]矩阵逐行进行
-// 以行为一个block, 求Y向的softmax
-// 
-__global__ void self_attn_fp32_kernel(
-    const float *Q, const float *K, const float *V,
-    float *output,
-    int M, int N, int d,
-    float *gBlkData
+// tx是代表tile内的一列，ty是tile内的一行, 一个block里Bc个线程
+// -> tx[Bc个]
+// \|/
+// ty[Br个]
+//
+template <int Bc, int Br>
+__global__ void self_attn_fp32_v1_kernel(
+  const float *Q, const float *K, const float *V,
+  float *output,
+  int M, int N, int d,
+  float *l, float *m
 ) {
-  int tidX = threadIdx.y;
-  int tidY = threadIdx.x;
-  int offX = tidX + blockDim.y * blockIdx.y;
-  int offY = tidY + blockDim.x * blockIdx.x;
-  if(offX >= M || offY >= N) return;
-  // 计算[M,N]矩阵的初始值, KT[x,y] = K[y,x]
-  // 使用KT的[i, offY]即K[offY, i]
-  float fac = 1.0f / sqrt((float)d);
-  float qkt = 0.0f;
-  for(int i=0;i<d;++i) {
-    int offQ = offX * d + i;
-    int offKT = offY * d + i;
-    if(offQ < M * d && offKT < N * d) {
-      qkt += Q[offQ] * K[offKT];
-    }         
-  }
-  qkt /= sqrt((float)d);
-  // [offX, offY]进行Y方向block的softmax
-  float maxVal = block_reduce_max_Y(qkt, N, gBlkData);
-  float sumVal = block_reduce_sum_Y(qkt, maxVal, N, gBlkData);
-  // printf("loc: (%d, %d), qkt: %.9f maxVal: %.9f sumVal: %.9f\n", offX, offY, qkt, maxVal, sumVal);
-  // printf("sumVal: %.9f\n", sumVal);
-  float softmax_qkt = exp(qkt - maxVal) / sumVal;
-  // 计算结果
-  for(int i=0;i<d;++i) {
-    int offV = offY * d + i;
-    int output_off = offX * d + i;
-    if(output_off < M * d) {
-      atomicAdd(&output[output_off], V[offV] * softmax_qkt);
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  int Tr = (M + Br - 1) / Br;
+  int Tc = (N + Bc - 1) / Bc;
+  // sram, Kj[Bc x d], Vj [Bc x d]
+  // sram mapping Br x d + Bc x d + Bc x d [Qi, Kj, Vj]
+  int Q_off = Br * d;
+  int K_off = Bc * d;
+  int V_off = Bc * d;
+  int S_off = Br * Bc;
+  extern __shared__ float sMem[];
+  float *Qi = sMem;
+  float *Kj = &sMem[Q_off];
+  float *Vj = &sMem[Q_off + K_off];
+  float *Sij = &sMem[Q_off + K_off + V_off];
+  for(int j=0;j<Tc;++j) {
+    // Load Kj, Vj
+    for(int i=0;i<d;++i) {
+      Kj[tx * d + i] = K[K_off * j + tx * d + i];
+      Vj[tx * d + i] = V[K_off * j + tx * d + i];
+    }
+    __syncthreads(); // Bc内同步
+    for(int i=0;i<Tr;++i) {
+      // Load Qi
+      for(int x=0;x<d;++x) {
+        Qi[ty * d + x] = Q[i * Q_off + ty * d + x];
+      }
+      __syncthreads();
+      // calculate Sij
+      // Br x d 
+      // Bc x d
+      float row_max_prev = m[i * Br + ty];
+      float row_sum_prev = l[i * Br + ty];
+      for(int i1=0;i1<Br;++i1) {
+        float row_max = -FLT_MAX;
+        for(int j1=0;j1<Bc;++j1) {
+          float sum = 0.0f;
+          for(int k1=0;k1<d;++k) {
+            sum += Qi[i1 * d + k1] * Kj[j1 * d + k1];
+          }
+          sum /= sqrtf((float)d);
+          Sij[i1 * Bc + j1] = sum;
+          row_max = fmax(row_max, sum);
+        }
+        // Pi1j1 = Si1j1 - row_max
+        // update Sij use exp
+        float row_sum = 0.0f;
+        for(int j1=0;j1<Bc;++j1) {
+          Sij[i1 * Bc + j1] = exp(Sij[i1 * Bc + j1] - row_max);
+          row_sum += Sij[i1 * Bc + j1];
+        }
+        // update new m and l(one row)
+        float m_new = fmax(row_max, row_max_prev);
+        float l_new = exp(row_max_prev - m_new) * row_sum_prev + exp(m_new - row_max_prev) * row_sum_prev;
+        m[i * Br + ty] = m_new;
+        l[i * Br + ty] = l_new;
+        // update output
+        for(j1=0;j1<d;++j1) {
+          float SV = 0.0f;
+          for(k1=0;k1<Bc;++k1) {
+            SV += Sij[i1 * Bc + k1] * Vj[k1 * d + j1];
+          }
+          output[i * Q_off + ty * d + j1] = 
+            1.0f / l_new * row_sum_prev * exp(row_max_prev - m_new) * output[i * Q_off + ty * d + j1] + 
+            exp(row_max - m_new) * SV;
+        }
+        __syncthreads();
+      }
+      __syncthreads();
     }
   }
 }
 
-TORCH_BINDING_SELF_ATTN_IMPL(fp32, torch::kFloat32, float, 1)
+TORCH_BINDING_SELF_ATTN_V1_IMPL(fp32_v1, torch::kFloat32, float, 1)
