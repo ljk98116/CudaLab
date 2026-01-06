@@ -11,4 +11,4 @@ if __name__ == "__main__":
   test_add2()
   test_reduce()
   test_softmax()
-  # test_self_attn()
+  test_self_attn()

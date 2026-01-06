@@ -30,27 +30,32 @@ torch::Tensor self_attn_##tag(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
   auto res = torch::zeros(                                              \
       {M, d},                                                           \
       torch::TensorOptions()                                            \
-          .dtype(Q.dtype())                                             \
+          .dtype(torch::kFloat32)                                       \
           .device(Q.device())                                           \
   );                                                                    \
-  auto l = torch::zeros({M});                                           \
-  auto m = torch::zeros({M});                                           \
+  auto l = torch::zeros({M}, torch::TensorOptions().dtype(torch::kFloat32).device(Q.device())); \
+  auto m = torch::full(                                                 \
+    {M},                                                                \
+    -FLT_MAX,                                                           \
+    torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));  \
                                                                         \
-  static constexpr int Br = 4;                                          \
-  static constexpr int Bc = 4;                                          \
+  static constexpr int Br = 32;                                         \
+  static constexpr int Bc = 1;                                          \
                                                                         \
-  dim3 threadsPerBlock(WARP_SIZE * WARP_SIZE, 1);                       \
-  dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,   \
-                      (M + threadsPerBlock.y - 1) / threadsPerBlock.y); \
+  dim3 threadsPerBlock(Br, 1);                                          \
+  dim3 blocksPerGrid((M + Br - 1) / Br, 1);                             \
                                                                         \
-  self_attn_##tag##_kernel<<<blocksPerGrid, threadsPerBlock>>>(         \
+  size_t sMem = (((Bc << 1) + Br) * d + Bc * Br) * sizeof(float);       \
+  self_attn_##tag##_kernel<Bc, Br><<<blocksPerGrid, threadsPerBlock, sMem>>>( \
     Q.data_ptr<element_type>(),                                         \
     K.data_ptr<element_type>(),                                         \
     V.data_ptr<element_type>(),                                         \
     res.data_ptr<element_type>(),                                       \
-    M, N, d                                                             \
+    M, N, d,                                                            \
+    l.data_ptr<float>(),                                                \
+    m.data_ptr<float>()                                                 \
   );                                                                    \
   return res;                                                           \
 }
 
-TORCH_BINDING_SELF_ATTN(fp32_v1, torch::kFloat32, float, 1)
+TORCH_BINDING_SELF_ATTN_V1(fp32_v1, torch::kFloat32, float, 1)

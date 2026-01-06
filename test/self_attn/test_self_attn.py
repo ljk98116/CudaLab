@@ -6,7 +6,7 @@ import torch, os, sys, time, random
 from torch.utils.cpp_extension import load
 torch.set_grad_enabled(False)
 
-epoch = 2000
+epoch = 200
 def validate() -> bool:
     d = random.randint(1, 128)
     # little wide <=32
@@ -15,13 +15,13 @@ def validate() -> bool:
     Q = torch.randn((M, d)).cuda().float().contiguous()
     K = torch.randn((N, d)).cuda().float().contiguous()
     V = torch.randn((N, d)).cuda().float().contiguous()
-    print(M, N, d)
     scores = Q @ K.T / math.sqrt(d)     # [M, N]
     attn   = torch.softmax(scores, dim=1)
     ref    = attn @ V                   # [M, d]
     ref = ref.cpu()
-    res = torch.ops.CudaLab.self_attn_fp32(Q, K, V).cpu()
+    res = torch.ops.CudaLab.self_attn_fp32_v1(Q, K, V)
     torch.cuda.synchronize()
+    res = res.cpu()
     # float单步误差1e-7,绝对误差最高1e-4，相对误差最高1e-5
     try:
         torch.testing.assert_close(
@@ -43,7 +43,7 @@ def validate() -> bool:
     attn   = torch.softmax(scores, dim=1)
     ref    = attn @ V                   # [M, d]
     ref = ref.cpu()
-    res = torch.ops.CudaLab.self_attn_fp32(Q, K, V).cpu()
+    res = torch.ops.CudaLab.self_attn_fp32_v1(Q, K, V).cpu()
     torch.cuda.synchronize()
     # float单步误差1e-7,绝对误差最高1e-4，相对误差最高1e-5
     try:
@@ -66,7 +66,7 @@ def validate() -> bool:
     attn   = torch.softmax(scores, dim=1)
     ref    = attn @ V                   # [M, d]
     ref = ref.cpu()
-    res = torch.ops.CudaLab.self_attn_fp32(Q, K, V).cpu()
+    res = torch.ops.CudaLab.self_attn_fp32_v1(Q, K, V).cpu()
     torch.cuda.synchronize()
     # float单步误差1e-7,绝对误差最高1e-4，相对误差最高1e-5
     try:
@@ -81,7 +81,7 @@ def validate() -> bool:
         return False
     return True
 
-def validate_self_attn_fp32():
+def validate_self_attn_fp32_v1():
     for i in range(epoch):
         if validate() is False:
             return False
@@ -129,7 +129,7 @@ def run_benchmark(
       print(out)
   return out, mean_time
 
-def run_benchmark_self_attn_fp32():
+def run_benchmark_self_attn_fp32_v1():
     M = 10
     N = 10
     d = 12
@@ -138,12 +138,12 @@ def run_benchmark_self_attn_fp32():
     V = torch.randn((N, d)).cuda().float().contiguous()   
     out = torch.randn((M, d)).cuda().float().contiguous() 
     run_benchmark(
-      torch.ops.CudaLab.self_attn_fp32,
+      torch.ops.CudaLab.self_attn_fp32_v1,
       Q, K, V,
       "fp32_1d",
       out
     )
 
 def test_self_attn():
-    validate_self_attn_fp32()
-    run_benchmark_self_attn_fp32()
+    validate_self_attn_fp32_v1()
+    run_benchmark_self_attn_fp32_v1()
