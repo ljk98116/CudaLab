@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <vector>
+#include <cmath>
 
 #define WARP_SIZE 32
 #define BLOCK_SIZE 1024

@@ -124,7 +124,7 @@ def run_benchmark(
   mean_time = total_time / iters
   out_info = f"self_attn_{tag}"
   out_val = out.detach().cpu().numpy().tolist()
-  print(f"{out_info:>18}: {out_val}, time:{mean_time:.8f}ms")
+  print(f"{out_info:>18}:time:{mean_time:.8f}ms")
   if show_all:
       print(out)
   return out, mean_time

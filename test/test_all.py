@@ -1,14 +1,38 @@
 import os, sys, time, torch
 
 from add2.test_add2 import test_add2
+
 from reduce.test_reduce import test_reduce
+
 from softmax.test_softmax import test_softmax
+
 from self_attn.test_self_attn import test_self_attn
+
+# from flash_attn.test_flash_attn import test_flash_attn
+
+from prefix_sum.test_prefix_sum_baseline import test_prefix_sum_baseline
+from prefix_sum.test_prefix_sum_v1 import test_prefix_sum_v1
+from prefix_sum.test_prefix_sum_v2 import test_prefix_sum_v2
+from prefix_sum.test_prefix_sum_v3 import test_prefix_sum_v3
+from prefix_sum.test_prefix_sum_v4 import test_prefix_sum_v4
+
 # 遍历测试目录运行所有测试
 if __name__ == "__main__":
   root = os.getcwd()
   torch.ops.load_library(root + '/build/libCudaLab.so')
-  test_add2()
-  test_reduce()
-  test_softmax()
-  test_self_attn()
+
+  # test_add2()
+
+  # test_reduce()
+
+  # test_softmax()
+
+  # test_self_attn()
+
+  # test_flash_attn()
+
+  test_prefix_sum_baseline()
+  test_prefix_sum_v1()
+  test_prefix_sum_v2()
+  test_prefix_sum_v3()
+  test_prefix_sum_v4()

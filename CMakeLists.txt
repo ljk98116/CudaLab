@@ -7,8 +7,8 @@ set(ENV{TORCH_CUDA_ARCH_LIST} "8.9")
 set(CMAKE_CUDA_ARCHITECTURES 80-real;89-real)
 set(Torch_DIR "/mnt/disk4t/home/ljk/.local/lib/python3.8/site-packages/torch/share/cmake/Torch")
 
-enable_language(CUDA)
 project(CudaLab LANGUAGES CXX CUDA)
+enable_language(CUDA)
 
 find_package(CUDA REQUIRED)
 find_library(NVTOOLSEXT_LIBRARY
