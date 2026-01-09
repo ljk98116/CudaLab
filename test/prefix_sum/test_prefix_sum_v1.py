@@ -81,7 +81,7 @@ def run_benchmark(
     return out, mean_time
 
 def run_benchmark_prefix_sum_v1_fp32_1d():
-    N = 1000000
+    N = 10000000
     x = torch.randn((N)).cuda().float().contiguous()  
     out = torch.randn((N)).cuda().float().contiguous() 
     run_benchmark(

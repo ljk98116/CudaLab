@@ -4,6 +4,7 @@
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <vector>

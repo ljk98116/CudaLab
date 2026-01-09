@@ -17,7 +17,7 @@ static __device__ __forceinline__ float ScanBlock(float v) {
   int warp_id = threadIdx.x >> 5;
   int lane_id = threadIdx.x & 31;
   // 每个warp的前缀和,初始为每个warp内的值的和
-  __shared__ float warp_sum[WARP_NUM];
+  __shared__ float warp_sum[WARP_NUM]; 
   // 计算每个warp内的前缀和，此时warp内的前缀和都已经在输入位置就位
   v = ScanWarp(v);
   // warp内最后一个位置是这个warp内的和
@@ -43,116 +43,109 @@ static __device__ __forceinline__ float ScanBlock(float v) {
   return v;
 }
 
-static __device__ __forceinline__
-float WarpLookbackPipeline(int bid, BlockPrefix* g) {
-  float local = 0.0f;
-  int lane = threadIdx.x & 31;
-
-  // 每个 warp 处理一个 window
-  int look = bid - 1 - (threadIdx.x >> 5) * 32;
-
-  while (look >= 0) {
-    int idx = look - lane;
-
-    int state = INVALID;
-    float val = 0.0f;
-
-    if (idx >= 0) {
-      state = g[idx].state;
-      val   = g[idx].sum;
-    }
-
-    unsigned mask_complete =
-      __ballot_sync(0xffffffff, state == COMPLETE);
-
-    if (mask_complete) {
-      int leader = __ffs(mask_complete) - 1;
-      if (lane == leader)
-        local += val;
-      break;
-    }
-
-    if (state == PARTIAL)
-      local += val;
-
-    look -= 32 * (blockDim.x >> 5);
-  }
-
-  // warp reduction
-  #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    local += __shfl_down_sync(0xffffffff, local, off);
-
-  return local;
-}
-
 
 __global__ void ScanAndWritePartSumKernelV4(
-  const float *input, BlockPrefix *g_block_prefix, float *output, int N
+  const float *input, BlockPrefix *g_block_prefix, float *output, int N, int *g_vp_counter
 ) {
   int tid = threadIdx.x;
-  int bid = blockIdx.x;
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   float v = idx < N ? input[idx] : 0.0f;
   // 计算block内前缀和
-  float block_prefix = ScanBlock(v);
-
-  // warp0 lane31 拿最终 block_sum
-  float block_sum;
-  if ((threadIdx.x >> 5) == 0 && (threadIdx.x & 31) == WARP_NUM - 1)
-    block_sum = block_prefix;
-
-  // broadcast
-  block_sum = __shfl_sync(0xffffffff, block_sum, WARP_NUM - 1);
-
+  float aggregate = ScanBlock(v);
+  __shared__ int vp_id;
   // 线程0写全局数组，写partial
-  if(threadIdx.x == 0) {
-    g_block_prefix[blockIdx.x].sum = block_sum;
-    __threadfence(); //保证此时这个block的sum属于全局可见的状态,注意区分__threadfence_block()对block内可见
-    g_block_prefix[blockIdx.x].state = PARTIAL;
+  if(threadIdx.x == blockDim.x - 1) {
+    vp_id = atomicAdd(g_vp_counter, 1);
+    // g_block_prefix[blockIdx.x].aggregate = aggregate;
+    // __threadfence(); //保证此时这个block的sum属于全局可见的状态,注意区分__threadfence_block()对block内可见
+    // g_block_prefix[blockIdx.x].state = PARTIAL;
+    BlockPrefix v;
+    v.sum = aggregate;
+    v.state = PARTIAL;
+    atomicExch(
+      reinterpret_cast<unsigned long long*>(&g_block_prefix[vp_id].packed),
+      v.packed
+    );
   }
   __syncthreads();
+  
+  // float block_exclusive = 0.0f;
+  // int lane = threadIdx.x & 31;
+  // int lookback = vp_id - 1;
+  // 串行执行look back
+  // if(tid == 31 && vp_id > 0) {
+  //   while(lookback >= 0) {
+  //     int state = g_block_prefix[lookback].state;
+  //     if(state == INVALID) continue;
+  //     if(state == PARTIAL) {
+  //       block_exclusive += g_block_prefix[lookback].sum;
+  //       --lookback;
+  //     }
+  //     else if(state == COMPLETE) {
+  //       block_exclusive += g_block_prefix[lookback].sum;
+  //       break;
+  //     }
+  //   }
+  //   // g_block_prefix[bid].inclusive_prefix = aggregate + block_exclusive;
+  //   // __threadfence();
+  //   // g_block_prefix[bid].state = COMPLETE;
+  //   BlockPrefix v_acc;
+  //   v_acc.sum = aggregate + block_exclusive;
+  //   v_acc.state = COMPLETE;
+  //   atomicExch(
+  //     reinterpret_cast<unsigned long long*>(&g_block_prefix[vp_id].packed),
+  //     v_acc.packed
+  //   );
+  // }
 
-  __shared__ bool do_lookback;
-  if (tid == 0) {
-    int old = atomicCAS(&g_block_prefix[bid].state,
-                        PARTIAL,
-                        LOOKBACK);
-    do_lookback = (old == PARTIAL);
-  }
-  __syncthreads();
+  // 并行执行lookback
+  // 循环往前推一组线程
+  int state = INVALID; // 当前线程映射到对应的之前的part的状态
+  float sum = 0.0f; // 当前线程迭代过程产生的累加和
+  
+  int lookback = vp_id - 1;
+  lookback -= WARP_SIZE - 1 - tid;
+  if(tid < WARP_SIZE) {
+    while(lookback >= 0) {
+      BlockPrefix b_prefix;
+      unsigned long long packed;
+      do {
+        // packed = atomicAdd(
+        //   reinterpret_cast<unsigned long long*>(&g_block_prefix[lookback].packed),
+        //   0ull
+        // );
+        packed = __ldg(&g_block_prefix[lookback].packed);
+      } while((packed >> 32) == INVALID);
 
-  // look back, 将全局block前缀和数组进行更新
-  __shared__ float base;
-  float warp_base = WarpLookbackPipeline(bid, g_block_prefix);
+      b_prefix.packed = packed;
 
-  if ((threadIdx.x & 31) == 0) {
-    if ((threadIdx.x >> 5) == 0)
-      base = warp_base;
-    else
-      atomicAdd(&base, warp_base);
-  }
-  __syncthreads();
+      state = b_prefix.state;
+      sum += b_prefix.sum;
 
-  // 完成 lookback
-  if (do_lookback && tid == 0) {
-    g_block_prefix[bid].sum += base;
-    __threadfence();
-    g_block_prefix[bid].state = COMPLETE;
-  }
-  __syncthreads();
+      if(state == COMPLETE) break;
 
-  // 非 lookback block：等前一个 COMPLETE
-  if (!do_lookback && bid > 0 && tid == 0) {
-    while (g_block_prefix[bid - 1].state != COMPLETE) {
-      // very short spin
+      lookback -= WARP_SIZE; // 向前看一个WARP_SIZE
     }
   }
-  __syncthreads();
+  // // 对sum值做warp reduce add
+  float block_exclusive = ScanWarp(sum);
+  // 取lane = 31时的结果
+  block_exclusive = __shfl_sync(0xffffffff, block_exclusive, 31);
+  // 只在tid = 31时,用block_exclusive更新状态
+  if(tid == WARP_SIZE - 1) {
+    // 更新block状态
+    BlockPrefix v_acc;
+    v_acc.sum = aggregate + block_exclusive;
+    v_acc.state = COMPLETE;
+    atomicExch(
+      reinterpret_cast<unsigned long long*>(&g_block_prefix[vp_id].packed),
+      v_acc.packed
+    );
+  }
   // 累加前面的block的sum
-  if(blockIdx.x > 0) block_prefix += g_block_prefix[blockIdx.x - 1].sum;
+  aggregate += block_exclusive;
   if(idx < N) {
-    output[idx] = block_prefix;
+    output[idx] = aggregate;
   }
 }
 
